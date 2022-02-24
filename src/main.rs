@@ -1,10 +1,16 @@
+mod samples;
+mod animations;
+mod net;
+
+#[macro_use]
+extern crate serde_derive;
+
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
-use std::{io, thread};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use rppal::gpio::{Gpio, Level, Trigger};
-use rppal::gpio::Trigger::RisingEdge;
+use std::{io};
+use std::net::TcpListener;
+use std::time::{SystemTime, UNIX_EPOCH};
+use rppal::gpio::{Gpio, Trigger};
 
 fn pause() {
     let mut stdin = io::stdin();
@@ -19,161 +25,60 @@ fn pause() {
 }
 
 fn main() {
-    // cycles counter
-    let cycles = Arc::new(Mutex::new(0_u64));
-    let cycles_2 = Arc::clone(&cycles);
 
-    // period
-    let period = Arc::new(Mutex::new(1000000000 / 12));
-    let period_2 = Arc::clone(&period);
+    let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
 
     // GPIO
     let gpio = Gpio::new().unwrap();
     let mut interrupt_pin = gpio.get(5).unwrap().into_input();
 
-    // Slice
-    let slice = Arc::new(Mutex::new(0));
-    let slice_2 = Arc::clone(&slice);
+    let mut slice = 0;
+    let mut frame = 0;
 
-    // Sum
-    let mut sum = 0;
+    let mut latest_interrupt = 0;
 
-    let latest_interrupt = Arc::new(Mutex::new(0));
+    let mut frames = 0;
+    let mut slices = 0;
+
+    let mut f = OpenOptions::new().write(true).read(false).open("/dev/tpic6c595.0").unwrap();
 
     interrupt_pin.set_async_interrupt(Trigger::FallingEdge, move |_| {
+
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-        let delta = now.as_nanos() - *latest_interrupt.lock().unwrap();
-        *latest_interrupt.lock().unwrap() = now.as_nanos();
+        let delta = now.as_nanos() - latest_interrupt;
+        latest_interrupt = now.as_nanos();
 
-
-
-        if delta > 1000000000 {
+        if delta > 1000000000 || delta < 800000 {
             return;
         }
 
-        if delta > 42 * 1000000 {
-            sum += delta;
-            *cycles_2.lock().unwrap() += 1;
-
-            *slice.lock().unwrap() = 0; // set slice to 0
-
-            if *cycles_2.lock().unwrap() % 24 == 0 {
-                let d = sum / 2 / 24;
-                sum = 0;
-                println!("Recalc {}", d);
-                // calculate frequency
-                *period_2.lock().unwrap() = d; // update frequency
-            }
+        if delta > 6800000 {
+            slice = 0;
+            frame += 1;
+        } else if delta > 800000 {
+            slice += 1;
         }
+
+        f.write(&anim[frame % frames][slice % (slices * 2)]).unwrap();
     }).unwrap();
 
-    thread::spawn(move || {
-        loop {
-            println!("Cycles: {}", *cycles.lock().unwrap());
-            thread::sleep(Duration::new(1,0))
+    for stream in listener.incoming() {
+        let stream = stream.unwrap();
+
+        let mut s_anim = animations::horizontal_plane::BITMAP;
+
+        let mut anim: Vec<Vec<[u8; 8]>> = vec![];
+
+        for mut s_data in s_anim {
+            let mut data: Vec<[u8; 8]> = Vec::from(s_data);
+            s_data.reverse();
+            data.append(&mut Vec::from(s_data));
+            let mut d = vec![data];
+            anim.append(&mut d);
         }
-    });
 
-    let mut s_data: [[u8; 8]; 8] = [
-        [
-            0b00000000,
-            0b01111110,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b01111110,
-            0b00000000,
-        ],
-        [
-            0b00000000,
-            0b01000010,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b01000010,
-            0b00000000,
-        ],
-        [
-            0b00000000,
-            0b01000010,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b01000010,
-            0b00000000,
-        ],
-        [
-            0b00000000,
-            0b01000010,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b01000010,
-            0b00000000,
-        ],
-        [
-            0b00000000,
-            0b01000010,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b01000010,
-            0b00000000,
-        ],
-        [
-            0b00000000,
-            0b01000010,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b01000010,
-            0b00000000,
-        ],
-        [
-            0b00000000,
-            0b01000010,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b00000000,
-            0b01000010,
-            0b00000000,
-        ],
-        [
-            0b00000000,
-            0b01111110,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b01000010,
-            0b01111110,
-            0b00000000,
-        ],
-    ];
-    s_data.reverse();
-
-    let mut rev_data = Vec::from( s_data);
-    rev_data.reverse();
-
-    let mut data = Vec::from(s_data);
-    data.append(&mut rev_data);
-
-    thread::spawn(move || {
-        let mut f = OpenOptions::new().write(true).read(false).open("/dev/tpic6c595.0").unwrap();
-        loop {
-            let s = *slice_2.lock().unwrap();
-            *slice_2.lock().unwrap() += 1;
-            f.write(&data[s % 16]).unwrap();
-            let p = *period.lock().unwrap();
-            thread::sleep(Duration::new(0, (p / 8) as u32));
-        }
-    });
+        println!("Connection established!");
+    }
 
     pause();
 }
