@@ -2,15 +2,18 @@ mod samples;
 mod animations;
 mod net;
 
-#[macro_use]
-extern crate serde_derive;
-
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
 use std::{io};
-use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use rppal::gpio::{Gpio, Trigger};
+use futures::prelude::*;
+use tokio::net::TcpListener;
+use tokio_serde::formats::SymmetricalMessagePack;
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use crate::net::device_information::DeviceInformation;
+use crate::net::pack::Pack;
 
 fn pause() {
     let mut stdin = io::stdin();
@@ -24,9 +27,8 @@ fn pause() {
     let _ = stdin.read(&mut [0u8]).unwrap();
 }
 
-fn main() {
-
-    let listener = TcpListener::bind("127.0.0.1:7878").unwrap();
+#[tokio::main]
+pub async fn main() {
 
     // GPIO
     let gpio = Gpio::new().unwrap();
@@ -37,12 +39,26 @@ fn main() {
 
     let mut latest_interrupt = 0;
 
-    let mut frames = 0;
-    let mut slices = 0;
+    let frames = Arc::new(Mutex::new(0));
+    let frames_2 = frames.clone();
+    let slices = Arc::new(Mutex::new(0));
+    let slices_2 = slices.clone();
+
+    let init = Arc::new(Mutex::new(false));
+    let init_2 = init.clone();
 
     let mut f = OpenOptions::new().write(true).read(false).open("/dev/tpic6c595.0").unwrap();
 
+    let anim: Arc<Mutex<Vec<Vec<[u8; 8]>>>> = Arc::new(Mutex::new(vec![]));
+    let anim_2 = anim.clone();
+
     interrupt_pin.set_async_interrupt(Trigger::FallingEdge, move |_| {
+        if !*init.lock().unwrap() {
+            return;
+        }
+
+        let frames = *frames.lock().unwrap();
+        let slices = *slices.lock().unwrap();
 
         let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
         let delta = now.as_nanos() - latest_interrupt;
@@ -59,26 +75,57 @@ fn main() {
             slice += 1;
         }
 
-        f.write(&anim[frame % frames][slice % (slices * 2)]).unwrap();
+        f.write(&anim.lock().unwrap()[frame % frames][slice % (slices * 2)]).unwrap();
     }).unwrap();
 
-    for stream in listener.incoming() {
-        let stream = stream.unwrap();
+    let listener = TcpListener::bind("0.0.0.0:7878").await.unwrap();
 
-        let mut s_anim = animations::horizontal_plane::BITMAP;
+    println!("listening on {:?}", listener.local_addr());
 
-        let mut anim: Vec<Vec<[u8; 8]>> = vec![];
+    loop {
+        let (socket, _) = listener.accept().await.unwrap();
 
-        for mut s_data in s_anim {
-            let mut data: Vec<[u8; 8]> = Vec::from(s_data);
-            s_data.reverse();
-            data.append(&mut Vec::from(s_data));
-            let mut d = vec![data];
-            anim.append(&mut d);
+        let (read, write) = socket.into_split();
+
+        let ld = FramedWrite::new(write, LengthDelimitedCodec::new());
+        let mut serialized = tokio_serde::SymmetricallyFramed::new(
+            ld,
+            SymmetricalMessagePack::<DeviceInformation>::default(),
+        );
+
+        serialized.send(DeviceInformation {
+            product_id: "testing".to_string(),
+            serial_number: "testing".to_string(),
+            vox_size: [8, 8, 16],
+        }).await.unwrap();
+
+        // Delimit frames using a length header
+        let length_delimited = FramedRead::new(read, LengthDelimitedCodec::new());
+
+        // Deserialize frames
+        let mut deserialized = tokio_serde::SymmetricallyFramed::new(
+            length_delimited,
+            SymmetricalMessagePack::<Pack>::default(),
+        );
+
+        // Spawn a task that prints all received messages to STDOUT
+        while let Some(msg) = deserialized.try_next().await.unwrap() {
+            let pack: Pack = msg;
+
+            let mut anim_c: Vec<Vec<[u8; 8]>> = vec![];
+
+            for mut s_data in pack.data {
+                let mut data: Vec<[u8; 8]> = s_data.clone();
+                s_data.reverse();
+                data.append(&mut s_data);
+                let mut d = vec![data];
+                anim_c.append(&mut d);
+            }
+
+            *anim_2.lock().unwrap() = anim_c;
+            *frames_2.lock().unwrap() = pack.anim_rate;
+            *slices_2.lock().unwrap() = pack.slices;
+            *init_2.lock().unwrap() = true;
         }
-
-        println!("Connection established!");
     }
-
-    pause();
 }

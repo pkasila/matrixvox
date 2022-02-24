@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, PartialEq, Deserialize, Serialize)]
 pub struct Pack {
-    anim_rate: usize,
-    slices: usize,
-    data: Vec<Vec<Vec<[u8; 8]>>>,
+    pub anim_rate: usize,
+    pub slices: usize,
+    pub data: Vec<Vec<[u8; 8]>>,
 }
